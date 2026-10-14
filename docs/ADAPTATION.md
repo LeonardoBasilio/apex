@@ -19,7 +19,7 @@ Databricks, AWS/Azure) rather than rebuilding it from scratch.
 | **capture** (`jar/`) | Scala plugin on `SparkListener` | **PySpark native listener** — `sparkContext._jsc.sc().addSparkListener(...)` via py4j, no JVM build step | Avoids a Scala/sbt build entirely; PySpark 3.x exposes the same listener interface Java/Scala does. Trade-off: listener callbacks still run on the JVM thread, so the Python-side handler must stay non-blocking — this is the main engineering risk of the swap and gets its own ADR. |
 | **transport** (`collect/`) | OTel Collector (config-only) → ClickHouse | **Kafka** — the listener produces one event per stage/task/plan decision to a topic | Matches the ingestion pattern actually used in AWS/Azure data platforms (MSK / Event Hubs) instead of an OTel sidecar. Decouples capture rate from store write rate — a slow Postgres write no longer backs up the Spark job itself. |
 | **store** (`infra/` ClickHouse+HyperDX) | ClickHouse (columnar, built for this) | **Postgres**, fed by a Kafka consumer that aggregates before insert | Matches the requested stack. Known trade-off, accepted deliberately: Postgres is not a columnar store, so the consumer pre-aggregates (rolling stats per stage, not per task) before the insert, and any raw-task-level drill-down stays in Kafka's retention window, not in Postgres. This boundary is the single most important documented trade-off in this port — see [CONTRACT.md](../CONTRACT.md) ground rules once this lane's contract delta is drafted. |
-| **reason** (`engine/`) | Python + CrewAI, deterministic detectors first | unchanged | Already the target stack. |
+| **reason** (`engine/`) | Python + CrewAI, deterministic detectors first | **`engine-postgres/`** — physics.py (the closed form) ported verbatim, reading `store-postgres/`'s schema | Already the target language; only the read path and the scope changed. Deliberately v1-scoped: no plan-evidence join detection, no noise-floor history, no job_conf-sourced width — each is a missing *input* (deferred upstream in `capture-pyspark/`), not a weaker reimplementation. See `engine-postgres/README.md`'s "What's deferred" table. |
 | **answer** (`serve/`) | Python + FastMCP | unchanged | Already the target stack. |
 | **memory** / **verify** | Python, ClickHouse reads | Python, Postgres reads | Query layer only; detector logic is store-agnostic by design in the original (lanes only talk through the contract). |
 | **generate** (`dev/`) | PySpark + Delta lab | unchanged, add a Databricks Job variant | Shows the same lab running both locally (Docker) and as a Databricks job — the two deployment targets this case is meant to prove. |
@@ -34,6 +34,11 @@ Not "I copied an open-source repo." The portfolio claim is specific:
 
 ## Status
 
-Scaffolding only at this point — directory skeleton + this note. Implementation proceeds lane
-by lane, starting with `capture-pyspark/` (replaces `jar/`), each lane keeping its own tests
-green before the next one starts, same house rule as upstream: **no silent green**.
+Implemented and verified live, end to end: `capture-pyspark/` → `stream-kafka/` →
+`store-postgres/` → `engine-postgres/`. A crafted skewed stage event produced through the real
+chain (Kafka → the running `store-postgres` consumer → Postgres) reproduces the exact verdict
+CONTRACT.md's rule 1 predicts — critical on 8 slots, no finding at all on 2 slots, same data —
+see `engine-postgres/README.md`'s "Verified live" section. Each lane kept its own tests green
+before the next one started, same house rule as upstream: **no silent green**. Still not done:
+`dev/`'s pathology lab port (a real Spark job instead of a crafted event) and plan/AQE
+extraction in `capture-pyspark/`.

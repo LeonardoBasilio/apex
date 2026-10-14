@@ -1,0 +1,21 @@
+[project]
+name = "apex-engine-postgres"
+version = "0.1.0"
+description = "v1 scoped port of upstream engine/'s tail-bound skew detector, reading from store-postgres's schema."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.1,<4"]
+dev = ["pytest>=8,<9"]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/apex_engine_postgres"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
