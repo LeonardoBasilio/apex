@@ -38,11 +38,35 @@ doesn't exist past `capture-pyspark/`'s in-memory aggregator today.
 ## DDL ownership
 
 Mirrors upstream's rule: `create_schema: false` everywhere else. Tables are versioned
-migrations in this directory; `engine/`, `serve/`, `memory/`, `verify/` only `SELECT`/`INSERT`
-into tables this lane defines.
+migrations in [`ddl/`](ddl/) (`001_stage_events.sql`, applied in filename order by
+`apex_store.migrate.apply_ddl`); `engine/`, `serve/`, `memory/`, `verify/` only
+`SELECT`/`INSERT` into tables this lane defines.
+
+## Implemented
+
+- **`ddl/001_stage_events.sql`** — the v1 subset table: identity + the stage metrics
+  `capture-pyspark/` actually emits. `PRIMARY KEY (job_id, stage_id, stage_attempt)`.
+- **`apex_store.migrate.apply_ddl(connection, ddl_dir)`** — executes each `*.sql` file in
+  filename order, committing after each one (a failure partway through leaves prior
+  migrations applied, not rolled back together).
+- **`apex_store.consumer.StageEventConsumer`** — reads only `apex.spark.stage_events`
+  messages (a message on `apex.spark.plan_events` is counted and ignored, not treated as an
+  error — there's nothing shaped to insert from that topic yet). `ON CONFLICT (job_id,
+  stage_id, stage_attempt) DO NOTHING` makes a redelivered message a no-op rather than a
+  duplicate row, covering Kafka's at-least-once delivery after a consumer restart before an
+  offset commit. A malformed or missing-field payload — including stream-kafka's own
+  "degraded envelope" for an event it couldn't serialize — is counted
+  (`ConsumeStats.skipped_malformed`) and skipped, never inserted with nulls standing in for
+  real data.
+- **`apex_store.connection.from_dsn()`** — thin `psycopg` wrapper exposing
+  `execute`/`commit`; every other module depends on that shape as a Protocol, not this
+  concrete class, so `migrate.py`'s and `consumer.py`'s own tests run without a Postgres
+  driver installed.
+
+12 tests, no Postgres server needed to run them.
 
 ## Status
 
-Not yet implemented. `capture-pyspark/` (producer, done) and `stream-kafka/` (transport,
-producer side done) exist; this lane is next — the DDL for `stage_events` plus the consumer
-that reads `apex.spark.stage_events` and inserts.
+Done: DDL, migration runner, consumer with idempotent insert. Not done: wiring a real Kafka
+consumer client (`kafka-python`'s `KafkaConsumer`) to feed `StageEventConsumer.consume_many`
+continuously, and the `engine/`/`serve/` read-side queries against this schema.
