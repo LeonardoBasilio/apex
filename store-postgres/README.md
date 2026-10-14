@@ -62,11 +62,55 @@ migrations in [`ddl/`](ddl/) (`001_stage_events.sql`, applied in filename order 
   `execute`/`commit`; every other module depends on that shape as a Protocol, not this
   concrete class, so `migrate.py`'s and `consumer.py`'s own tests run without a Postgres
   driver installed.
+- **`docker-compose.yml`** — closes the infra loop: `kafka` (single-node KRaft) +
+  `postgres` + a containerized `consumer` running `scripts/run_consumer.py` continuously
+  (`apply_ddl` on start, then consumes `apex.spark.stage_events` forever).
 
-12 tests, no Postgres server needed to run them.
+14 unit tests (no Postgres/Kafka needed), + 1 live integration test
+(`tests/test_integration_live.py`, skipped unless `POSTGRES_DSN` and
+`KAFKA_BOOTSTRAP_SERVERS` are set — see below).
+
+## Run against Docker Compose
+
+```sh
+cp .env.example .env
+make up      # kafka + postgres + consumer, DDL applied, topics created
+make smoke   # produces one fake stage_completed event, confirms it lands in postgres
+make logs    # tail the consumer
+make down    # stop (keeps volumes)
+```
+
+**Verified live**, not just assumed to work: `make smoke` passes end to end — a message
+produced from a host Python process reaches the containerized consumer's own long-running
+Kafka consumer group with **zero lag**, and the row is queryable in Postgres immediately
+after.
+
+### Two real pitfalls this surfaced, fixed in `docker-compose.yml`
+
+Both looked like "the consumer is just hanging" with no error pointing at the cause — the
+kind of thing that's easy to paper over with a longer timeout instead of finding. Neither is
+specific to this port; both apply to any single-broker Kafka setup:
+
+1. **Topic-creation race.** `consumer` subscribes at container start, before any topic
+   necessarily exists yet. `kafka-python`'s client only refreshes topic metadata every
+   `metadata_max_age_ms` (default 5 minutes) — a consumer that started before the topic
+   existed stays blind to it for up to 5 minutes after the topic is finally auto-created by
+   the first producer. Fixed by a `kafka-init` one-shot service that creates both topics
+   explicitly before `consumer` is allowed to start (`depends_on: condition:
+   service_completed_successfully`).
+2. **Default replication factor.** Kafka's internal `__consumer_offsets` topic — every
+   consumer group's coordinator depends on it existing — defaults to replication factor 3,
+   unsatisfiable on a single broker. The failure mode isn't an error: the broker logs "Sent
+   auto-creation request for Set(__consumer_offsets)..." once per poll, forever, and every
+   consumer group hangs indefinitely with no coordinator. Disabling topic auto-create
+   entirely was tried first (looked like the right fix for pitfall #1) and made this one
+   worse, since that flag also gates `__consumer_offsets` itself. Fixed by setting
+   `KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1` (and the transaction-log equivalents) —
+   see the comment block at the top of `docker-compose.yml`.
 
 ## Status
 
-Done: DDL, migration runner, consumer with idempotent insert. Not done: wiring a real Kafka
-consumer client (`kafka-python`'s `KafkaConsumer`) to feed `StageEventConsumer.consume_many`
-continuously, and the `engine/`/`serve/` read-side queries against this schema.
+Done: DDL, migration runner, consumer with idempotent insert, a verified-live Docker Compose
+stack. Not done: the `engine/`/`serve/` read-side queries against this schema, and wiring a
+real Spark job (via `capture-pyspark/` + `stream-kafka/`) instead of this lane's own smoke
+producer — that needs `dev/`'s pathology lab ported next.

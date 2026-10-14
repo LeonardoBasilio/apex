@@ -1,0 +1,148 @@
+# Apex (portfolio port) · store-postgres — the canonical local stack this
+# port stores into. Three services:
+#
+#   kafka (single-node KRaft)  <--consume--  consumer  --INSERT-->  postgres
+#        ^ produced by capture-pyspark (via stream-kafka) in the real path,
+#          or by this lane's own integration test for a smoke run.
+#
+# Postgres applies ddl/*.sql on first boot via the official image's
+# /docker-entrypoint-initdb.d mechanism (files run in filename order,
+# alphabetically, same numbering convention as upstream's infra/sql/). That
+# only happens once, against an empty data volume — `consumer`'s entrypoint
+# re-runs apex_store.migrate.apply_ddl on every start too (CREATE TABLE IF
+# NOT EXISTS, so a repeat run is a no-op), the same "idempotent re-apply"
+# role upstream's infra/Makefile's `apply-ddl` target plays.
+#
+# Kafka uses a dual-listener setup: INTERNAL for other containers on this
+# compose network (consumer, and anything joining `apex-portfolio` from
+# outside), EXTERNAL for the host machine (a locally-run Spark job, or this
+# lane's own integration test run from a host Python venv).
+#
+# Topics are created explicitly by `kafka-init` rather than relying only on
+# Kafka's auto-create-on-first-produce: `consumer` subscribes at startup,
+# before any topic exists, and kafka-python's client only refreshes topic
+# metadata every `metadata_max_age_ms` (default 5 minutes) -- a consumer
+# that started before a topic existed can stay blind to it for up to 5
+# minutes after auto-create finally fires on the producer's first send.
+# Explicit creation up front removes that race instead of just shortening
+# it.
+#
+# The replication-factor-1 overrides below fix a SEPARATE, nastier problem
+# found running this stack's own smoke test for the first time: every
+# KAFKA_*_REPLICATION_FACTOR here defaults to 3 in stock Kafka, which is
+# unsatisfiable on a single-broker cluster. The broker doesn't fail loudly
+# -- it logs "Sent auto-creation request for Set(__consumer_offsets)..."
+# once per consumer poll, forever, and every consumer group hangs
+# indefinitely trying to find a coordinator that can never exist. No
+# message, no timeout, no stack trace points at the real cause; disabling
+# auto-create first (a plausible-looking fix for the race above) only made
+# it worse, since that flag also gates __consumer_offsets itself.
+
+name: apex-portfolio
+
+services:
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: apex-portfolio-kafka
+    ports:
+      - "${KAFKA_HOST_PORT:-9094}:9094"
+    environment:
+      KAFKA_NODE_ID: 0
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:${KAFKA_HOST_PORT:-9094}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      # Left on deliberately -- see below. Our OWN topics are still created
+      # explicitly by kafka-init (that's what actually fixes the race this
+      # note describes); turning this off entirely was tried first and
+      # broke every consumer group outright, because Kafka's internal
+      # __consumer_offsets topic (every group's coordinator depends on it
+      # existing) is ALSO gated by this flag. With it off, the broker just
+      # logs "Sent auto-creation request for Set(__consumer_offsets)..."
+      # forever and no consumer group can ever form.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Default is 3 -- impossible to satisfy on a single-broker cluster, so
+      # __consumer_offsets creation silently never completes and every
+      # consumer group hangs forever trying to find its coordinator (this
+      # IS the single-node-KRaft pitfall the note above was chasing before
+      # finding this; disabling auto-create was a red herring).
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      CLUSTER_ID: apex-portfolio-kraft-cluster-1
+    volumes:
+      - kafka-data:/var/lib/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    networks: [apex-portfolio]
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: apex-portfolio-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-apex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-apex_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-apex}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./ddl:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-apex} -d ${POSTGRES_DB:-apex}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks: [apex-portfolio]
+
+  # One-shot: creates both topics explicitly before `consumer` ever
+  # subscribes -- see the note above on why auto-create is off.
+  kafka-init:
+    image: apache/kafka:3.7.0
+    container_name: apex-portfolio-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists --topic apex.spark.stage_events \
+          --partitions 1 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists --topic apex.spark.plan_events \
+          --partitions 1 --replication-factor 1
+    networks: [apex-portfolio]
+
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: apex-portfolio-consumer
+    environment:
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-apex}:${POSTGRES_PASSWORD:-apex_local_dev}@postgres:5432/${POSTGRES_DB:-apex}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [apex-portfolio]
+
+networks:
+  apex-portfolio: {}
+
+volumes:
+  kafka-data: {}
+  postgres-data: {}

@@ -19,6 +19,14 @@ class PsycopgConnection:
         with self._raw.cursor() as cursor:
             cursor.execute(sql, params)
 
+    def fetchone(self, sql: str, params: Optional[dict] = None) -> Optional[tuple]:
+        """Not part of the DBConnection Protocol migrate.py/consumer.py
+        depend on -- this is a verification convenience for callers (tests,
+        the smoke script) that already hold a concrete PsycopgConnection."""
+        with self._raw.cursor() as cursor:
+            cursor.execute(sql, params)
+            return cursor.fetchone()
+
     def commit(self) -> None:
         self._raw.commit()
 
