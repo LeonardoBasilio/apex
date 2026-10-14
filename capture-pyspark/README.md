@@ -31,6 +31,19 @@ this queue: `onTaskEnd`/`onStageCompleted` do their work synchronously on the li
 thread (cheap in-memory bookkeeping only, see below), and only `onStageCompleted` ever calls
 `queue.submit()` — one message per *stage*, not per task.
 
+## A second real risk this trade introduces (found running it, not designing it)
+
+Registering the listener needs more than `gateway.start_callback_server()`. PySpark's JVM
+gateway is launched with the callback port already fixed (usually disabled) at startup;
+starting the server afterward opens a socket on a new ephemeral port the JVM was never told
+about. The result wasn't an error — every callback silently failed with
+`Connection refused`, retried forever, and `attach()`'s queue sat at `received=0` for an
+entire real 2M-row job. `listener.attach()` now uses PySpark's own
+`ensure_callback_server_started` (the exact function `pyspark.sql.streaming.listener`'s
+`StreamingQueryListener` uses internally for the same kind of JVM→Python callback), which
+also calls `GatewayServer.resetCallbackClient(...)` to tell the JVM the real port. See
+[`dev-pyspark/README.md`](../dev-pyspark/README.md) for the live run that surfaced this.
+
 ## Captured fields (parity target with `jar/`)
 
 Same four categories the Scala plugin captures, redacted the same way (plan literal-stripped
@@ -45,18 +58,29 @@ in-process before it ever leaves the driver — see [README §Privacy](../README
   extraction (`extract.py`) is best-effort: every JVM accessor is wrapped individually, so a
   version-drifted or missing method degrades that one field to `None` rather than losing the
   whole event, or — worse — silently reading it as `0`.
-- plan fingerprint (operators only, columns renamed `none#N`, literals dropped) — **deferred**
-- AQE decisions (skew-join coalesce, partition count changes) — **deferred**; forwarded
-  generically today via `onOtherEvent`'s fallback in `__getattr__`, raw and unshaped
+- plan fingerprint (operators only, columns renamed `none#N`, literals dropped) — **deferred**;
+  no listener-bus event carries the full logical plan the way `SparkListenerSQLAdaptiveExecutionUpdate`
+  carries the physical one, so this needs `QueryExecutionListener`
+  (`spark.listenerManager.register`) — a separate registration point from `addSparkListener`,
+  not yet wired.
+- **AQE decisions (`aqe.py`) — implemented**: tracks the physical-plan snapshot
+  `SparkListenerSQLAdaptiveExecutionUpdate` carries per `execution_id`, diffs consecutive
+  snapshots, and classifies `skew_split`/`join_switch`/`coalesce`/`other` from structural
+  markers only (operator names, never literal data — see `aqe.py`'s module docstring on
+  redaction). `skew_split` detection is grounded in a real captured transition (see
+  `dev-pyspark/README.md`); `join_switch` and `coalesce` are implemented from upstream's
+  documented conventions but **not yet exercised by a real run**.
 - resolved Spark config (the keys the detectors key off — e.g. `spark.sql.adaptive.skewJoin.enabled`) — **deferred**
 
-None of the JVM accessors in `extract.py` have been exercised against a live Spark cluster
-yet — only against duck-typed fakes in `tests/fakes.py` that mirror the method names Spark's
-Scala API exposes. That gap is tracked, not hidden; closing it is the first thing to do once
-a real cluster is available (same item upstream's own README lists first in its Roadmap).
+Stage-metrics extraction (`extract.py`) and AQE extraction (`aqe.py`) have both now been
+validated against a real Spark 4.0.1 cluster (`dev-pyspark/`'s skew-join job), not only against
+duck-typed fakes — the fakes still carry the tests day to day, but the shapes they mirror are
+no longer guesses.
 
 ## Status
 
-Done: non-blocking queue, listener bridge, per-stage percentile aggregation, Kafka wiring via
-[`stream-kafka/`](../stream-kafka/)'s producer. Not done: plan fingerprint + AQE extraction,
-live-cluster validation.
+Done: non-blocking queue, listener bridge, per-stage percentile aggregation, AQE
+`skew_split`/`join_switch`/`coalesce` transition capture, Kafka wiring via
+[`stream-kafka/`](../stream-kafka/)'s producer — all verified against a real Spark job in
+[`dev-pyspark/`](../dev-pyspark/). Not done: plan fingerprint extraction, `join_switch`/`coalesce`
+validation against a real triggering run, resolved-config capture.

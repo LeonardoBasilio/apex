@@ -1,0 +1,22 @@
+# One-shot: runs jobs/skew_join_job.py against store-postgres/'s already-up
+# Kafka. Depends on `store-postgres`'s own `docker compose up` having run
+# first -- this file joins ITS network by name rather than owning its own
+# Kafka, same "throwaway vs. owned" split upstream draws between collect/'s
+# test-only ClickHouse and infra/'s real one.
+name: apex-dev-pyspark
+
+services:
+  skew-join-job:
+    build:
+      context: ..
+      dockerfile: dev-pyspark/Dockerfile
+    container_name: apex-dev-pyspark-skew-join
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    networks:
+      - apex-portfolio
+
+networks:
+  apex-portfolio:
+    name: apex-portfolio_apex-portfolio
+    external: true

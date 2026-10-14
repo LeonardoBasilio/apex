@@ -73,6 +73,33 @@ def test_on_stage_completed_with_no_prior_task_end_still_enqueues_zero_stats():
     assert payload["task_duration_sample_count"] == 0
 
 
+def test_on_other_event_recognizes_an_aqe_update_and_enqueues_a_transition():
+    class FakeAdaptiveUpdate:
+        def executionId(self):
+            return 0
+
+        def physicalPlanDescription(self):
+            return "+- SortMergeJoin Inner (13)\n"
+
+    listener = _listener()
+    listener.onOtherEvent(FakeAdaptiveUpdate())
+
+    assert listener._queue.stats().received == 1
+    item = listener._queue._queue.get_nowait()
+    assert item["type"] == "plan_transition"
+    assert item["event"]["execution_id"] == 0
+    assert item["event"]["job_id"] == "job-1"
+
+
+def test_on_other_event_forwards_non_aqe_events_generically():
+    listener = _listener()
+    listener.onOtherEvent(object())  # no executionId()/physicalPlanDescription()
+
+    assert listener._queue.stats().received == 1
+    item = listener._queue._queue.get_nowait()
+    assert item["type"] == "onOtherEvent"
+
+
 def test_non_on_attribute_raises_attribute_error():
     listener = _listener()
     with pytest.raises(AttributeError):

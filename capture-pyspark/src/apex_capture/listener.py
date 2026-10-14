@@ -18,6 +18,7 @@ import time
 from typing import Callable, Optional
 
 from .aggregator import ZERO_STATS, StageAggregator
+from .aqe import AQETracker
 from .extract import build_stage_contract_event, extract_stage_key, extract_task_duration_ms
 from .queue_worker import NonBlockingEventQueue
 
@@ -41,6 +42,7 @@ class CaptureListener:
         self._job_id = job_id
         self._app_id = app_id
         self._aggregator = aggregator if aggregator is not None else StageAggregator()
+        self._aqe_tracker = AQETracker()
 
     def onTaskEnd(self, java_event) -> None:
         """Pure in-memory bookkeeping — this must NEVER touch the queue; see
@@ -63,6 +65,23 @@ class CaptureListener:
         )
         self._queue.submit(
             {"type": "stage_completed", "received_at": time.time(), "event": contract_event}
+        )
+
+    def onOtherEvent(self, java_event) -> None:
+        """Most things that reach `onOtherEvent` are not AQE updates (job/
+        stage SQL-execution lifecycle events, etc.) — `AQETracker.process`
+        returns None for those via duck-typing, and this falls back to the
+        same generic forwarding `__getattr__` would give any other on*
+        event, so nothing is lost for event types this method doesn't
+        specifically recognize."""
+        transition = self._aqe_tracker.process(java_event, job_id=self._job_id)
+        if transition is not None:
+            self._queue.submit(
+                {"type": "plan_transition", "received_at": time.time(), "event": transition.__dict__}
+            )
+            return
+        self._queue.submit(
+            {"type": "onOtherEvent", "received_at": time.time(), "event": java_event}
         )
 
     def __getattr__(self, name: str):
@@ -103,10 +122,24 @@ def attach(
     has no Kafka dependency of its own. `job_id` defaults to the Spark
     applicationId (see CONTRACT.md's "trace key"); pass it explicitly to use
     `spark.apex.job_id` instead.
+
+    Starting the callback server is NOT just `gateway.start_callback_server()`
+    — found running this against a real cluster, not in a design doc. py4j's
+    gateway is created with the JVM already pointed at a fixed callback port
+    from launch (usually 0 / disabled); starting the server afterward opens
+    a socket on a new ephemeral port the JVM was never told about, so every
+    callback the JVM tries to deliver gets `Connection refused`, silently
+    retried per event, forever. The fix is PySpark's own
+    `ensure_callback_server_started`, which the SAME SparkListenerInterface
+    integration point `pyspark.sql.streaming.listener.StreamingQueryListener`
+    uses internally — it starts the server, reads back the OS-assigned port,
+    and calls `GatewayServer.resetCallbackClient(...)` on the JVM side so it
+    actually dials back to the right port. Plain `start_callback_server()`
+    skips exactly that reset call.
     """
-    jvm_gateway = spark_context._gateway
-    if jvm_gateway._callback_server is None:
-        jvm_gateway.start_callback_server()
+    from pyspark.java_gateway import ensure_callback_server_started
+
+    ensure_callback_server_started(spark_context._gateway)
 
     app_id = spark_context.applicationId
     resolved_job_id = job_id or app_id
