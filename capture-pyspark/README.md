@@ -24,22 +24,39 @@ and *other* listeners on the same bus — including Spark's own UI/history-serve
 stall with it. This is the inverse of Apex's own thesis: a capture layer is not allowed to
 be the thing that makes the job it's observing slower.
 
-**Mitigation, not yet implemented:** the listener callback only enqueues the raw event
-(non-blocking, bounded queue, drop-oldest under backpressure) onto a background thread that
-owns the actual Kafka producer. A dropped event must be *counted*, never silent — same rule
-upstream calls "no silent green," applied to data loss instead of test coverage.
+**Implemented:** `queue_worker.NonBlockingEventQueue` — `submit()` never blocks the caller;
+under backpressure it drops the *oldest* queued event to make room for the newest and always
+counts the drop (`QueueStats.dropped`), never silently. `listener.CaptureListener` runs on
+this queue: `onTaskEnd`/`onStageCompleted` do their work synchronously on the listener-bus
+thread (cheap in-memory bookkeeping only, see below), and only `onStageCompleted` ever calls
+`queue.submit()` — one message per *stage*, not per task.
 
 ## Captured fields (parity target with `jar/`)
 
 Same four categories the Scala plugin captures, redacted the same way (plan literal-stripped
 in-process before it ever leaves the driver — see [README §Privacy](../README.md#privacy-diagnosable-without-your-data)):
 
-- stage metrics (bytes/tasks/duration per stage)
-- plan fingerprint (operators only, columns renamed `none#N`, literals dropped)
-- AQE decisions (skew-join coalesce, partition count changes)
-- resolved Spark config (the keys the detectors key off — e.g. `spark.sql.adaptive.skewJoin.enabled`)
+- **stage metrics (bytes/tasks/duration per stage) — implemented**, v1 subset of
+  `CONTRACT.md`'s field set: identity + shuffle/spill/gc/input/output bytes +
+  `task_duration_p50_ms`/`p99_ms`/`max_ms`/`sample_count`. The percentiles are computed by
+  `aggregator.StageAggregator` **in-process**, from every `onTaskEnd` for that stage —
+  nothing per-task ever reaches the queue or Kafka (see
+  [`stream-kafka/README.md`](../stream-kafka/README.md)'s revision note for why). Field
+  extraction (`extract.py`) is best-effort: every JVM accessor is wrapped individually, so a
+  version-drifted or missing method degrades that one field to `None` rather than losing the
+  whole event, or — worse — silently reading it as `0`.
+- plan fingerprint (operators only, columns renamed `none#N`, literals dropped) — **deferred**
+- AQE decisions (skew-join coalesce, partition count changes) — **deferred**; forwarded
+  generically today via `onOtherEvent`'s fallback in `__getattr__`, raw and unshaped
+- resolved Spark config (the keys the detectors key off — e.g. `spark.sql.adaptive.skewJoin.enabled`) — **deferred**
+
+None of the JVM accessors in `extract.py` have been exercised against a live Spark cluster
+yet — only against duck-typed fakes in `tests/fakes.py` that mirror the method names Spark's
+Scala API exposes. That gap is tracked, not hidden; closing it is the first thing to do once
+a real cluster is available (same item upstream's own README lists first in its Roadmap).
 
 ## Status
 
-Not yet implemented — scaffold only. First task: a minimal listener that proves the
-non-blocking queue under synthetic backpressure before any real Kafka wiring lands.
+Done: non-blocking queue, listener bridge, per-stage percentile aggregation, Kafka wiring via
+[`stream-kafka/`](../stream-kafka/)'s producer. Not done: plan fingerprint + AQE extraction,
+live-cluster validation.
