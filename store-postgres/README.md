@@ -15,17 +15,25 @@ the volume a real Spark job produces will not perform the same way, full stop. T
 README's "no silent green": pretending this lane has ClickHouse's query profile would be the
 exact failure mode Apex's whole thesis argues against.
 
-**The actual boundary:**
+**The actual boundary** (revised — see [`stream-kafka/README.md`](../stream-kafka/README.md)'s
+revision note): [`capture-pyspark/`](../capture-pyspark/)'s `aggregator.py` computes
+per-stage task-duration percentiles **in-process, before anything reaches Kafka**. There is
+no raw per-task topic to consume, so this is not "ClickHouse aggregates on read, Postgres
+aggregates on write by convention" — raw per-task numbers never exist anywhere past the
+Spark driver's memory for the few seconds a stage runs. That is a real capability loss
+(no later drill-down to an individual task), traded for a transport and store that never see
+task-level volume at all, which is a cheaper trade-off than "store it all in Kafka and hope
+Postgres never needs it":
 
 | Granularity | Where it lives | Why |
 |---|---|---|
-| Per-stage aggregates (bytes/task, p50/p99 duration, task count) | **Postgres**, one row per stage per run | This is everything the skew/tail/spill detectors in `engine/` actually read — upstream's own detectors key off stage-level stats, not raw tasks. |
-| Per-task raw metrics | **Kafka topic retention only**, not inserted into Postgres by default | Keeps Postgres write volume bounded regardless of job size. A task-level drill-down tool would read Kafka directly (or a time-boxed replay), not Postgres. |
-| Plan fingerprints + AQE decisions | **Postgres**, one row per stage transition | Low cardinality; this is what `verify/`'s mechanism checks and `memory/`'s plan-shape recall both need. |
+| Per-stage aggregates (bytes/task, p50/p99/max duration, task count) | **Postgres**, one row per stage per run | This is everything the skew/tail/spill detectors in `engine/` actually read — upstream's own detectors key off stage-level stats, not raw tasks. |
+| Per-task raw metrics | **Nowhere** — discarded by `capture-pyspark/`'s aggregator immediately after it folds a task's duration into that stage's running percentile state | No consumer in this port has ever needed a single task's duration on its own; upstream's own detectors are stage-level too. |
+| Plan fingerprints + AQE decisions | **Postgres**, one row per stage transition | Low cardinality; this is what `verify/`'s mechanism checks and `memory/`'s plan-shape recall both need. Extraction for these from capture-pyspark is still deferred (see its README). |
 
-If a future lane genuinely needs raw per-task Postgres rows (e.g. a finer tail-latency
-model), that's a contract change — add a table, document the write-volume cost in this
-README, never silently widen what the consumer inserts.
+If a future lane genuinely needs raw per-task data (e.g. a finer tail-latency model), that's
+a contract change at the capture layer first — not a Postgres schema change — since the data
+doesn't exist past `capture-pyspark/`'s in-memory aggregator today.
 
 ## DDL ownership
 
@@ -35,5 +43,6 @@ into tables this lane defines.
 
 ## Status
 
-Not yet implemented — scaffold only. Depends on `stream-kafka/`'s topic schema being frozen
-first (same "contract before code" discipline as upstream's `CONTRACT.md`).
+Not yet implemented. `capture-pyspark/` (producer, done) and `stream-kafka/` (transport,
+producer side done) exist; this lane is next — the DDL for `stage_events` plus the consumer
+that reads `apex.spark.stage_events` and inserts.
