@@ -1,3 +1,7 @@
+> **This branch (`portfolio/aws-databricks-stack`) is a portfolio port** of the architecture
+> below onto PySpark/Kafka/Postgres — see [`PORTFOLIO.md`](PORTFOLIO.md) for what was built
+> and proven. Everything from here down is the original upstream project's own README.
+
 # Apex
 
 ### Spark performance intelligence that knows when to say nothing.
