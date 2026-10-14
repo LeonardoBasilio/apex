@@ -1,0 +1,45 @@
+{
+  "name": "apex-portfolio-skew-join-demo",
+  "tags": {
+    "project": "apex-portfolio-port",
+    "lane": "dev-pyspark"
+  },
+  "max_concurrent_runs": 1,
+  "tasks": [
+    {
+      "task_key": "skew_join",
+      "description": "Runs dev-pyspark/jobs/skew_join_job.py unmodified -- the same script already verified against the local Docker Compose stack (see dev-pyspark/README.md). Only the cluster env vars change between targets.",
+      "spark_python_task": {
+        "python_file": "dbfs:/apex-portfolio/jobs/skew_join_job.py",
+        "parameters": []
+      },
+      "new_cluster": {
+        "spark_version": "15.4.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 2,
+        "data_security_mode": "SINGLE_USER",
+        "spark_conf": {
+          "spark.sql.shuffle.partitions": "8",
+          "spark.sql.adaptive.enabled": "true",
+          "spark.sql.adaptive.skewJoin.enabled": "true",
+          "spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes": "1048576",
+          "spark.sql.adaptive.skewJoin.skewedPartitionFactor": "2",
+          "spark.sql.adaptive.coalescePartitions.enabled": "false",
+          "spark.sql.autoBroadcastJoinThreshold": "-1"
+        },
+        "spark_env_vars": {
+          "KAFKA_BOOTSTRAP_SERVERS": "{{secrets/apex-portfolio/msk_bootstrap_brokers}}"
+        },
+        "init_scripts": [
+          {
+            "volumes": {
+              "destination": "/Volumes/apex_portfolio/capture/init_scripts/install_apex_capture.sh"
+            }
+          }
+        ]
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 0
+    }
+  ]
+}

@@ -14,118 +14,147 @@ cluster and the same ratio on a 50-slot cluster mean opposite things. That disci
 decoupled lanes, a frozen contract between them, deterministic logic before any LLM — is the
 part worth demonstrating independently of the original stack.
 
-This branch ports that architecture to **PySpark, Kafka, Postgres, Docker, and Databricks/AWS**
-instead of Scala, OTel Collector, and ClickHouse. Four lanes, each a real engineering decision
-with a stated trade-off, not a global search-and-replace:
+This branch ports that architecture to **PySpark, Kafka, Postgres, Docker, and
+Databricks/AWS** instead of Scala, OTel Collector, and ClickHouse. Six lanes, each a real
+engineering decision with a stated trade-off, not a global search-and-replace:
 
 ```mermaid
 flowchart LR
-    L["capture-pyspark<br/>native SparkListener"] -->|stage_completed event| K["stream-kafka<br/>producer"]
+    D["dev-pyspark<br/>real skewed join"] -->|SparkListener events| L["capture-pyspark<br/>native listener + AQE capture"]
+    L -->|stage_completed event| K["stream-kafka<br/>producer"]
     K -->|Kafka topic| C["store-postgres<br/>consumer"]
     C -->|INSERT| PG[("Postgres<br/>stage_events")]
     PG -->|SELECT| E["engine-postgres<br/>tail-bound detector"]
     E -->|Finding| OUT(["critical / warning / nothing,<br/>depending on cluster width"])
+    CLOUD["deploy-cloud<br/>Terraform + Databricks Job"]
 ```
 
 ## What was actually proven, not just built
 
-The strongest claim a portfolio case can make is a command and its real output. This is one,
-run against the live stack (not mocked):
+The strongest claim a portfolio case can make is a command and its real output — from a
+**real Spark job**, not a crafted event. `dev-pyspark/`'s 2M-row skewed join ran in a real
+`apache/spark:4.0.1` container, AQE genuinely split one of its skewed partitions (task count
+rose from 8 to 9), and the resulting row landed in Postgres through the real Kafka chain:
 
 ```sh
-$ POSTGRES_DSN=postgresql://apex:apex_local_dev@localhost:5432/apex \
-    python scripts/analyze_job.py demo-skew-job-001 --slots 8
+$ POSTGRES_DSN=... python engine-postgres/scripts/analyze_job.py local-1791941143879 --slots 8
 ```
 ```json
 {"findings": [{"severity": "critical",
-  "evidence": "p99/p50 = 20.70x ... > (n-1)/(slots-1) = (100-1)/(8-1) = 14.14 [operator]; an ideal rebalance could remove at most 39.6% of this stage's wall time",
-  ...}]}
+  "evidence": "p99/p50 = 5.11x on stage 4 ... > (n-1)/(slots-1) = (9-1)/(8-1) = 1.14 [operator]; an ideal rebalance could remove at most 78.0% of this stage's wall time",
+  "details": {"tail_bound_margin": 4.47, "slots": 8}}]}
 ```
 ```sh
-$ python scripts/analyze_job.py demo-skew-job-001 --slots 2   # same stored row
+$ python engine-postgres/scripts/analyze_job.py local-1791941143879 --slots 2   # same stored row
 ```
 ```json
 {"findings": []}
 ```
 
-Same stage, same ratio, same row in Postgres — produced through a real Kafka topic and
-consumed by a real running container, not a fixture. One cluster width makes it critical; a
-narrower one makes it nothing, because a 20.7× ratio needs more than 49× to be tail-bound on
-2 slots. That asymmetry is the entire reason Apex's closed form exists instead of a fixed
-`5×`/`10×` rule, and reproducing it end-to-end through a different stack is the proof the
-architecture's lane boundaries actually hold — not just that the code compiles.
+Same real job, same real stored row — critical at 8 slots, nothing at all at 2 slots, because
+5.11× needs more than 8× to be tail-bound on a 2-slot cluster. That asymmetry is the entire
+reason Apex's closed form exists instead of a fixed `5×`/`10×` rule, and reproducing it from
+an actual Spark execution through a different stack — not a fixture — is the proof the
+architecture's lane boundaries actually hold.
 
-## The four lanes
+The same run also produced a genuine AQE decision, captured structurally (no literal data) by
+`capture-pyspark/aqe.py`:
+
+```json
+{"execution_id": 0, "update_seq": 2, "transition_type": "skew_split",
+ "detail": "SortMergeJoin(skew=true) -- AQEShuffleRead split a skewed partition",
+ "before": "SortMergeJoin", "after": "SortMergeJoin(skew=true)", "confidence": "HIGH"}
+```
+
+## The six lanes
 
 | Lane | Replaces | What it does | Tests |
 |---|---|---|---|
-| [`capture-pyspark/`](capture-pyspark/) | `jar/` (Scala plugin) | Native `SparkListener` bridged through py4j — no JVM build step. Aggregates per-stage task-duration percentiles **in-process**, so a 10k-task stage produces one Kafka message, not 10k. | 28 |
+| [`dev-pyspark/`](dev-pyspark/) | `dev/` (Delta/MinIO lab) | A real 2M-row skewed sort-merge join, no S3/Delta dependency — just enough to produce genuine skew. | — (generates data for the others) |
+| [`capture-pyspark/`](capture-pyspark/) | `jar/` (Scala plugin) | Native `SparkListener` bridged through py4j — no JVM build step. Aggregates per-stage task-duration percentiles **in-process** (a 10k-task stage produces one Kafka message, not 10k) and captures real AQE plan transitions. | 39 |
 | [`stream-kafka/`](stream-kafka/) | `collect/` (OTel Collector) | Kafka producer, routes by event type, degrades an unshaped payload to a minimal envelope instead of crashing. | 9 |
-| [`store-postgres/`](store-postgres/) | `infra/` (ClickHouse) | DDL + idempotent Kafka consumer + a **verified-live Docker Compose stack** (Kafka KRaft + Postgres + a containerized consumer). | 13 unit + 1 live integration |
-| [`engine-postgres/`](engine-postgres/) | `engine/` (detectors) | The tail-bound skew physics, ported near-verbatim (it's pure math — nothing stack-specific to change), reading from Postgres. | 25 |
+| [`store-postgres/`](store-postgres/) | `infra/` (ClickHouse) | DDL + idempotent Kafka consumer + a **verified-live Docker Compose stack**. | 13 unit + 1 live integration |
+| [`engine-postgres/`](engine-postgres/) | `engine/` (detectors) | The tail-bound skew physics, ported near-verbatim, reading from Postgres. | 25 |
+| [`deploy-cloud/`](deploy-cloud/) | — | Terraform (AWS: MSK + RDS) + a Databricks Job running `dev-pyspark/`'s script unmodified. **Written and locally validated, not applied** — see its README. | — (IaC, not app code) |
 
-**75 unit tests, 0 requiring live infrastructure to pass, + 1 integration test that does.**
-Every lane's own README documents what it does, what it costs, and what's still missing —
-written the way the rest of this is: as a decision record, not a changelog.
+**86 unit tests, 0 requiring live infrastructure to pass**, plus one live integration test and
+the real end-to-end Spark run described above. Every lane's own README documents what it
+does, what it costs, and what's still missing — written as a decision record, not a
+changelog.
 
 ## Real engineering judgment calls, each with a documented trade-off
 
 A portfolio case built only from things that worked on the first try doesn't show much. These
 didn't:
 
-1. **Percentile aggregation moved into the capture layer, mid-build.** The original plan had a
-   per-task Kafka topic, with percentiles computed downstream. Before writing that consumer,
-   the math made the problem obvious: a 10k-task stage would mean 10k Kafka messages for a
-   number the Spark driver can compute for free. Reworked to aggregate in-process
-   (`capture-pyspark/aggregator.py`), synchronously, on the same thread that receives the
-   events — which only works because `onTaskEnd` is O(1) bookkeeping with no I/O. The topic was
-   deleted before it ever shipped. ([stream-kafka/README.md](stream-kafka/README.md)'s revision note)
+1. **Percentile aggregation moved into the capture layer, mid-build.** The original plan had
+   a per-task Kafka topic. A 10k-task stage would mean 10k Kafka messages for a number the
+   Spark driver can compute for free — reworked to aggregate in-process
+   (`capture-pyspark/aggregator.py`) before any code shipped.
+   ([stream-kafka/README.md](stream-kafka/README.md))
 
-2. **Two silent Kafka failures, found running the stack for real, not in a design doc.**
-   - A consumer that subscribes before its topic exists can stay blind to it for up to 5
-     minutes (`kafka-python`'s metadata refresh interval) after the topic is finally
-     auto-created — fixed by creating topics explicitly, before any consumer starts.
-   - Kafka's internal `__consumer_offsets` topic defaults to replication factor 3, which no
-     single-broker cluster can satisfy — every consumer group hangs forever with **no error
-     message**, just a broker silently retrying forever. The first fix attempt (disabling
-     topic auto-create) made this worse, since that flag also gates the internal topic. Root
-     cause confirmed by reading broker logs, not guessed. ([store-postgres/docker-compose.yml](store-postgres/docker-compose.yml)'s comments)
+2. **Two silent Kafka failures, found running the real stack.** A consumer that subscribes
+   before its topic exists can stay blind to it for 5 minutes after auto-create finally
+   fires; `__consumer_offsets`'s default replication factor (3) is unsatisfiable on one
+   broker, and every consumer group hangs forever with **no error message** — the first fix
+   attempt made it worse. Root cause confirmed by reading broker logs, not guessed.
+   ([store-postgres/docker-compose.yml](store-postgres/docker-compose.yml))
 
-3. **A scope cut stated as a cut, not hidden as a feature.** `engine-postgres/`'s detector
-   cannot detect join-vs-task skew (no captured query plan yet) and has no cross-run noise-floor
-   history (no history table yet). Rather than approximate either, the fix text explicitly says
-   it will not recommend `spark.sql.adaptive.skewJoin.*` without plan evidence, and every
-   finding takes upstream's own "no measured floor yet" confidence penalty. Documented as a
-   table of missing *inputs*, not weaker *logic*. ([engine-postgres/README.md](engine-postgres/README.md))
+3. **py4j's callback server silently dropped every event on a real cluster.**
+   `start_callback_server()` alone opens a socket the JVM was never told about — every
+   callback failed with `Connection refused`, forever, and a whole 2M-row job produced
+   `received=0`. Fixed with PySpark's own `ensure_callback_server_started`, the same helper
+   `StreamingQueryListener` uses internally. Found running a real job, not writing the
+   listener. ([capture-pyspark/README.md](capture-pyspark/README.md))
+
+4. **AQE erased the skew before this port ever measured it — CONTRACT.md's rule 7,
+   reproduced live.** The join's first version let AQE coalesce all 8 shuffle partitions into
+   1 task, because so little data survived partial aggregation. The skew was real and gone by
+   the time a listener could see it. ([dev-pyspark/README.md](dev-pyspark/README.md))
+
+5. **A scope cut stated as a cut, not hidden as a feature.** `engine-postgres/`'s detector
+   cannot detect join-vs-task skew (no captured query plan) and has no cross-run noise-floor
+   history. The fix text explicitly says it will not recommend
+   `spark.sql.adaptive.skewJoin.*` without plan evidence. Documented as missing *inputs*, not
+   weaker *logic*. ([engine-postgres/README.md](engine-postgres/README.md))
+
+6. **The cloud deployment stops at validated, not applied.** `deploy-cloud/`'s Terraform
+   passed `terraform validate` against real AWS credentials this session had — and was
+   deliberately never run through `plan` or `apply`. Provisioning MSK/RDS has real cost and
+   wasn't the point being proven. ([deploy-cloud/README.md](deploy-cloud/README.md))
 
 ## Stack mapping
 
 | Role | Upstream | This branch |
 |---|---|---|
+| Generate | PySpark + Delta/MinIO | PySpark, no Delta dependency |
 | Capture | Scala, compiled JVM plugin | Python, PySpark, py4j |
 | Transport | OpenTelemetry Collector | Kafka (KRaft, single-broker) |
 | Store | ClickHouse + HyperDX | Postgres |
 | Detection | Python (unchanged) | Python, same physics, Postgres reads |
 | Local infra | Docker Compose | Docker Compose |
-| Target deploy (next) | — | Databricks Job / AWS (MSK, RDS) |
+| Cloud target | — | Terraform (AWS: MSK + RDS) + Databricks Job — written, validated, not applied |
 
 See [`docs/ADAPTATION.md`](docs/ADAPTATION.md) for the lane-by-lane rationale this table
 summarizes.
 
 ## What's not done yet
 
-- `dev/`'s pathology lab (a real Spark job generating genuine skew) is not ported — every
-  verification so far uses a crafted event with the right shape, not a real Spark execution.
-  This is the next milestone.
-- Plan-fingerprint and AQE-decision capture in `capture-pyspark/` — blocks join-vs-task skew
-  detection and plan-shape memory.
-- A Databricks Job / AWS deployment target for the capture side.
+- Plan-fingerprint extraction (the full logical-plan hash) — needs `QueryExecutionListener`,
+  a separate registration point from the `SparkListener` this port already uses.
+- `join_switch` and `coalesce` AQE transitions are implemented from upstream's documented
+  conventions but not yet exercised by a real triggering run — only `skew_split` has been.
+- An actual cloud deployment: `deploy-cloud/`'s IaC has never been applied against a live
+  AWS account or submitted to a live Databricks workspace.
 
 ## Run it yourself
 
 ```sh
-cd store-postgres && cp .env.example .env && make up && make smoke
+cd store-postgres && cp .env.example .env && docker compose up -d --wait   # kafka+postgres+consumer
+cd ../dev-pyspark && docker compose build skew-join-job && docker compose run --rm skew-join-job
 ```
 
-Brings up Kafka + Postgres + the consumer, produces one event, confirms it lands. See each
-lane's own README for its unit tests (`python -m pytest`, no infra needed).
+Runs a real skewed Spark job through the whole chain. Then point
+`engine-postgres/scripts/analyze_job.py` at the `job_id` it prints (see
+[`dev-pyspark/README.md`](dev-pyspark/README.md) for the exact commands). Each lane's own
+README documents its unit tests (`python -m pytest`, no infra needed).
